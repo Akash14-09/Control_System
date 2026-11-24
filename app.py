@@ -1,316 +1,417 @@
 import json
 import numpy as np
 from scipy.optimize import minimize
-import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(
-    page_title="2D Self-Driving Car | Control Systems",
-    page_icon="🚗",
+    page_title="Inverted Pendulum | Control Systems Lab",
+    page_icon="⚖️",
     layout="wide",
 )
 
 # --- Session State for PID Gains ---
 if "kp" not in st.session_state:
-    st.session_state.kp = 0.15
+    st.session_state.kp = 65.0
 if "ki" not in st.session_state:
-    st.session_state.ki = 0.01
+    st.session_state.ki = 4.0
 if "kd" not in st.session_state:
-    st.session_state.kd = 0.25
+    st.session_state.kd = 14.0
 
 
-# --- Track & Kinematic Bicycle Physics ---
-def road_center_y(x, track_type):
-    if track_type == "S-Curves (Highway)":
-        return 6.0 * np.sin(0.035 * x) + 2.5 * np.sin(0.08 * x)
-    elif track_type == "Sharp Chicane":
-        return 8.0 * np.sin(0.055 * x)
-    else:  # Step Lane Change (Unit II: Step Input)
-        return np.where(x > 40.0, 5.0, 0.0)
+# --- Nonlinear Cart-Pole Physics (for Python AI Auto-Tuner) ---
+def cartpole_derivs(state, force, M, m, L, g=9.81):
+    x, x_dot, theta, theta_dot = state
+    sin_t = np.sin(theta)
+    cos_t = np.cos(theta)
+    total_m = M + m
+
+    # Nonlinear equations of motion (uniform rod of length 2*L)
+    temp = (force + m * L * (theta_dot ** 2) * sin_t) / total_m
+    theta_acc = (g * sin_t - cos_t * temp) / (L * (4.0 / 3.0 - (m * cos_t ** 2) / total_m))
+    x_acc = temp - (m * L * theta_acc * cos_t) / total_m - 0.1 * x_dot  # light track friction
+    return np.array([x_dot, x_acc, theta_dot, theta_acc])
 
 
-def simulate_car(kp, ki, kd, speed, friction, wind, track_type, steps=400, dt=0.05):
-    L = 2.5  # Wheelbase (meters)
-    max_steer = np.radians(32)
-    lane_half_width = 3.2
-
-    x, y, psi = 0.0, 0.0, 0.0
-    integral_err = 0.0
-    prev_err = road_center_y(0.0, track_type) - y
-
-    xs, ys, psis, steers, ctes, refs = [], [], [], [], [], []
-    off_road_steps = 0
-
-    for _ in range(steps):
-        y_ref = float(road_center_y(x, track_type))
-        cte = y_ref - y  # Cross-Track Error (Negative Feedback)
-
-        integral_err = np.clip(integral_err + cte * dt, -15.0, 15.0)
-        deriv_err = (cte - prev_err) / dt
-        prev_err = cte
-
-        # PID Steering Controller (Unit II)
-        raw_steer = kp * cte + ki * integral_err + kd * deriv_err
-        steer = float(np.clip(raw_steer, -max_steer, max_steer))
-
-        # Road friction limits effective turning grip
-        effective_steer = steer * friction
-
-        # Kinematic update + crosswind disturbance
-        x += speed * np.cos(psi) * dt
-        y += (speed * np.sin(psi) + wind) * dt
-        psi += (speed / L) * np.tan(effective_steer) * dt
-        psi = float(np.clip(psi, -np.pi / 2.2, np.pi / 2.2))
-
-        if abs(cte) > lane_half_width:
-            off_road_steps += 1
-
-        xs.append(round(x, 3))
-        ys.append(round(y, 3))
-        psis.append(round(psi, 4))
-        steers.append(round(steer, 4))
-        ctes.append(round(cte, 3))
-        refs.append(round(y_ref, 3))
-
-    return {
-        "x": xs,
-        "y": ys,
-        "psi": psis,
-        "steer": steers,
-        "cte": ctes,
-        "ref": refs,
-        "off_road": off_road_steps,
-        "max_err": float(np.max(np.abs(ctes))),
-        "mae": float(np.mean(np.abs(ctes))),
-    }
+def rk4_step(state, force, dt, M, m, L):
+    k1 = cartpole_derivs(state, force, M, m, L)
+    k2 = cartpole_derivs(state + 0.5 * dt * k1, force, M, m, L)
+    k3 = cartpole_derivs(state + 0.5 * dt * k2, force, M, m, L)
+    k4 = cartpole_derivs(state + dt * k3, force, M, m, L)
+    return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
 
-def ai_auto_tune(speed, friction, wind, track_type):
-    """Minimizes ITAE + crash penalty to find optimal PID gains."""
+def ai_auto_tune(M, m, L):
+    """Finds optimal (Kp, Ki, Kd) to stabilize the inverted pendulum after a disturbance."""
     def loss_fn(params):
         kp, ki, kd = params
-        if kp < 0 or ki < 0 or kd < 0 or kp > 2.0 or ki > 1.0 or kd > 2.0:
+        if kp < 5 or ki < 0 or kd < 1 or kp > 250 or ki > 50 or kd > 80:
             return 1e6
-        res = simulate_car(kp, ki, kd, speed, friction, wind, track_type, steps=300)
-        cte = np.array(res["cte"])
-        t = np.arange(len(cte)) * 0.05
-        itae = np.mean(t * np.abs(cte))
-        crash_penalty = res["off_road"] * 2.5
-        return float(itae + crash_penalty)
 
-    result = minimize(
+        state = np.array([0.0, 0.0, 0.18, 0.0])  # Start tilted by ~10.3 degrees
+        integral = 0.0
+        dt = 0.02
+        cost = 0.0
+
+        for step in range(250):  # 5 seconds simulation
+            x, x_dot, theta, theta_dot = state
+            if abs(theta) > 1.2 or abs(x) > 2.4:
+                return 1e5 + (250 - step) * 100.0  # Heavy penalty for falling
+
+            integral = np.clip(integral + theta * dt, -2.0, 2.0)
+            force = (kp * theta + ki * integral + kd * theta_dot) + (2.0 * x + 3.5 * x_dot)
+            force = float(np.clip(force, -50.0, 50.0))
+
+            state = rk4_step(state, force, dt, M, m, L)
+            t = step * dt
+            # ITAE cost on angle + small penalty on cart drift & force
+            cost += t * abs(theta) + 0.05 * abs(x) + 0.0005 * abs(force)
+
+        return float(cost)
+
+    res = minimize(
         loss_fn,
-        x0=[0.25, 0.05, 0.35],
+        x0=[65.0, 4.0, 14.0],
         method="Nelder-Mead",
-        options={"maxiter": 120},
+        options={"maxiter": 140},
     )
-    kp, ki, kd = np.clip(result.x, [0.01, 0.0, 0.0], [1.5, 0.5, 1.5])
-    return round(float(kp), 3), round(float(ki), 3), round(float(kd), 3)
+    kp, ki, kd = np.clip(res.x, [10.0, 0.0, 2.0], [200.0, 40.0, 60.0])
+    return round(float(kp), 1), round(float(ki), 1), round(float(kd), 1)
 
 
 # --- Sidebar Controls ---
-st.sidebar.header("🚗 Environment & Disturbances")
-track_type = st.sidebar.selectbox(
-    "Track Profile",
-    ["S-Curves (Highway)", "Sharp Chicane", "Step Lane Change (Unit II)"],
-)
-speed = st.sidebar.slider("Car Speed (m/s)", 8.0, 28.0, 16.0, step=1.0)
-
-road_surface = st.sidebar.selectbox(
-    "Road Condition (Friction)",
-    ["Dry Asphalt (1.0)", "Wet / Rainy (0.65)", "Icy Road (0.35)"],
-)
-friction_map = {"Dry Asphalt (1.0)": 1.0, "Wet / Rainy (0.65)": 0.65, "Icy Road (0.35)": 0.35}
-friction = friction_map[road_surface]
-
-wind = st.sidebar.slider("Crosswind Disturbance (m/s)", -2.5, 2.5, 0.0, step=0.25)
+st.sidebar.header("⚙️ Plant Parameters")
+pole_length = st.sidebar.slider("Pole Length (m)", 0.6, 2.0, 1.0, step=0.1)
+pole_mass = st.sidebar.slider("Pole Mass (kg)", 0.1, 1.5, 0.25, step=0.05)
+cart_mass = st.sidebar.slider("Cart Mass (kg)", 0.5, 3.0, 1.0, step=0.1)
 
 st.sidebar.divider()
-st.sidebar.header("🎛️ PID Steering Controller")
+st.sidebar.header("🎛️ Controller Mode")
+controller_on = st.sidebar.toggle("Enable PID Feedback Control", value=True)
 
 if st.sidebar.button("🤖 AI Auto-Tune PID", type="primary", use_container_width=True):
-    with st.spinner("Optimizing PID gains for current road & wind..."):
-        best_kp, best_ki, best_kd = ai_auto_tune(speed, friction, wind, track_type)
+    with st.spinner("Optimizing PID gains for current pole mass & length..."):
+        best_kp, best_ki, best_kd = ai_auto_tune(cart_mass, pole_mass, pole_length / 2.0)
         st.session_state.kp = best_kp
         st.session_state.ki = best_ki
         st.session_state.kd = best_kd
     st.sidebar.success(f"Tuned! Kp={best_kp}, Ki={best_ki}, Kd={best_kd}")
 
-kp = st.sidebar.slider("Proportional (Kp)", 0.01, 1.50, float(st.session_state.kp), step=0.01, key="kp")
-ki = st.sidebar.slider("Integral (Ki)", 0.00, 0.50, float(st.session_state.ki), step=0.01, key="ki")
-kd = st.sidebar.slider("Derivative (Kd)", 0.00, 1.50, float(st.session_state.kd), step=0.01, key="kd")
+kp = st.sidebar.slider("Proportional (Kp)", 0.0, 200.0, float(st.session_state.kp), step=1.0, key="kp")
+ki = st.sidebar.slider("Integral (Ki)", 0.0, 40.0, float(st.session_state.ki), step=0.5, key="ki")
+kd = st.sidebar.slider("Derivative (Kd)", 0.0, 60.0, float(st.session_state.kd), step=0.5, key="kd")
 
-# --- Run Simulation ---
-sim = simulate_car(kp, ki, kd, speed, friction, wind, track_type)
+# --- Main Header ---
+st.title("⚖️ Inverted Pendulum (Cart-Pole) Control Simulator")
+st.caption("Real-Time Nonlinear Physics Engine (RK4) • Closed-Loop PID Stabilization • AI Auto-Tuner")
 
-# --- Header & KPIs ---
-st.title("🚗 2D Self-Driving Car: Lane-Keeping Control Simulator")
-st.caption("Closed-Loop PID Steering + AI Auto-Tuner under Real-Time Road & Wind Disturbances")
+# --- Pass Parameters to Real-Time 60 FPS Canvas ---
+config = json.dumps({
+    "M": cart_mass,
+    "m": pole_mass,
+    "L": pole_length / 2.0,  # Half-length for uniform rod physics
+    "kp": kp,
+    "ki": ki,
+    "kd": kd,
+    "enabled": controller_on,
+})
 
-c1, c2, c3, c4 = st.columns(4)
-status = "✅ STABLE" if sim["off_road"] == 0 else "🚨 OFF-ROAD / UNSTABLE"
-c1.metric("Driving Status", status)
-c2.metric("Max Lane Deviation", f"{sim['max_err']:.2f} m", help="Road edge is at 3.20 m")
-c3.metric("Avg Tracking Error", f"{sim['mae']:.2f} m")
-c4.metric("Off-Road Frames", f"{sim['off_road']}")
-
-# --- Main Tabs ---
-tab_sim, tab_diag = st.tabs(["🎮 Live 2D Driving Simulator", "📊 Control Diagnostics (Unit II & III)"])
-
-with tab_sim:
-    sim_json = json.dumps({
-        "x": sim["x"],
-        "y": sim["y"],
-        "psi": sim["psi"],
-        "steer": sim["steer"],
-        "cte": sim["cte"],
-        "ref": sim["ref"],
-        "wind": wind,
-        "speed": speed,
-    })
-
-    html_canvas = f"""
-    <div style="background:#0f172a; border-radius:12px; padding:12px; font-family:sans-serif; color:#e2e8f0;">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-        <div>
-          <button id="playBtn" style="background:#22c55e; color:#000; border:none; padding:6px 14px; border-radius:6px; font-weight:bold; cursor:pointer;">⏸ Pause</button>
-          <button id="resetBtn" style="background:#334155; color:#fff; border:none; padding:6px 14px; border-radius:6px; margin-left:6px; cursor:pointer;">↺ Restart</button>
-        </div>
-        <div id="hud" style="font-size:14px; font-family:monospace;">Initializing...</div>
-      </div>
-      <canvas id="simCanvas" width="960" height="420" style="width:100%; background:#1e293b; border-radius:8px; display:block;"></canvas>
+html_code = f"""
+<div style="background:#0b1120; border:1px solid #1e293b; border-radius:14px; padding:16px; font-family:'Segoe UI', sans-serif; color:#e2e8f0;">
+  <!-- Top Controls & Live Telemetry -->
+  <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px;">
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button id="pushLeft" style="background:#3b82f6; color:#fff; border:none; padding:8px 14px; border-radius:8px; font-weight:600; cursor:pointer;">⬅️ Push Pole Left</button>
+      <button id="pushRight" style="background:#3b82f6; color:#fff; border:none; padding:8px 14px; border-radius:8px; font-weight:600; cursor:pointer;">➡️ Push Pole Right</button>
+      <button id="strongGust" style="background:#f59e0b; color:#000; border:none; padding:8px 14px; border-radius:8px; font-weight:600; cursor:pointer;">⚡ Strong Impulse</button>
+      <button id="resetBtn" style="background:#334155; color:#fff; border:none; padding:8px 14px; border-radius:8px; font-weight:600; cursor:pointer;">↺ Reset</button>
     </div>
+    <div id="statusBadge" style="padding:6px 14px; border-radius:20px; font-weight:700; font-size:13px; background:#065f46; color:#34d399;">
+      ● BALANCED
+    </div>
+  </div>
 
-    <script>
-      const data = {sim_json};
-      const canvas = document.getElementById("simCanvas");
-      const ctx = canvas.getContext("2d");
-      const hud = document.getElementById("hud");
-      const playBtn = document.getElementById("playBtn");
-      const resetBtn = document.getElementById("resetBtn");
+  <!-- Main 60 FPS Simulation Canvas -->
+  <canvas id="pendulumCanvas" width="1000" height="440" style="width:100%; background:#0f172a; border-radius:10px; display:block; border:1px solid #1e293b;"></canvas>
 
-      let idx = 0;
-      let playing = true;
-      const scale = 14; // pixels per meter
-      const laneHalf = 3.2;
+  <!-- Bottom Live Telemetry Bar -->
+  <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; margin-top:12px; text-align:center;">
+    <div style="background:#1e293b; padding:10px; border-radius:8px;">
+      <div style="font-size:11px; color:#94a3b8; text-transform:uppercase;">Pole Angle (θ)</div>
+      <div id="valAngle" style="font-size:20px; font-weight:700; font-family:monospace; color:#38bdf8;">0.0°</div>
+    </div>
+    <div style="background:#1e293b; padding:10px; border-radius:8px;">
+      <div style="font-size:11px; color:#94a3b8; text-transform:uppercase;">Cart Position (x)</div>
+      <div id="valPos" style="font-size:20px; font-weight:700; font-family:monospace; color:#e2e8f0;">0.00 m</div>
+    </div>
+    <div style="background:#1e293b; padding:10px; border-radius:8px;">
+      <div style="font-size:11px; color:#94a3b8; text-transform:uppercase;">Control Force (F)</div>
+      <div id="valForce" style="font-size:20px; font-weight:700; font-family:monospace; color:#22c55e;">0.0 N</div>
+    </div>
+    <div style="background:#1e293b; padding:10px; border-radius:8px;">
+      <div style="font-size:11px; color:#94a3b8; text-transform:uppercase;">Balance Time</div>
+      <div id="valTime" style="font-size:20px; font-weight:700; font-family:monospace; color:#f59e0b;">0.0 s</div>
+    </div>
+  </div>
+</div>
 
-      playBtn.onclick = () => {{
-        playing = !playing;
-        playBtn.textContent = playing ? "⏸ Pause" : "▶ Play";
-      }};
-      resetBtn.onclick = () => {{ idx = 0; playing = true; playBtn.textContent = "⏸ Pause"; }};
+<script>
+  const cfg = {config};
+  const canvas = document.getElementById("pendulumCanvas");
+  const ctx = canvas.getContext("2d");
 
-      function draw() {{
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const elAngle = document.getElementById("valAngle");
+  const elPos = document.getElementById("valPos");
+  const elForce = document.getElementById("valForce");
+  const elTime = document.getElementById("valTime");
+  const statusBadge = document.getElementById("statusBadge");
 
-        const carX = data.x[idx];
-        const carY = data.y[idx];
-        const psi = data.psi[idx];
-        const cte = data.cte[idx];
-        const steer = data.steer[idx];
+  // State: [x, x_dot, theta, theta_dot]
+  let state = [0.0, 0.0, 0.08, 0.0];
+  let integral = 0.0;
+  let force = 0.0;
+  let simTime = 0.0;
+  let fallen = false;
+  let angleHistory = [];
 
-        // Camera follows carX
-        const camX = carX - 18;
-        const toScreenX = (wx) => (wx - camX) * scale;
-        const toScreenY = (wy) => canvas.height / 2 - wy * scale;
+  const g = 9.81;
+  const dt = 0.016; // ~60 FPS physics step
+  const trackLimit = 2.6; // meters
 
-        // Draw Road Surface
-        ctx.beginPath();
-        for (let i = 0; i < data.x.length; i++) {{
-          const sx = toScreenX(data.x[i]);
-          const sy = toScreenY(data.ref[i] + laneHalf);
-          if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-        }}
-        for (let i = data.x.length - 1; i >= 0; i--) {{
-          const sx = toScreenX(data.x[i]);
-          const sy = toScreenY(data.ref[i] - laneHalf);
-          ctx.lineTo(sx, sy);
-        }}
-        ctx.closePath();
-        ctx.fillStyle = "#334155";
-        ctx.fill();
+  function resetSim() {{
+    state = [0.0, 0.0, 0.08, 0.0];
+    integral = 0.0;
+    force = 0.0;
+    simTime = 0.0;
+    fallen = false;
+    angleHistory = [];
+  }}
 
-        // Draw Road Borders
-        ctx.strokeStyle = "#f8fafc";
-        ctx.lineWidth = 2;
-        for (const offset of [laneHalf, -laneHalf]) {{
-          ctx.beginPath();
-          for (let i = 0; i < data.x.length; i++) {{
-            const sx = toScreenX(data.x[i]);
-            const sy = toScreenY(data.ref[i] + offset);
-            if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-          }}
-          ctx.stroke();
-        }}
+  document.getElementById("pushLeft").onclick = () => {{ state[3] -= 1.2; }};
+  document.getElementById("pushRight").onclick = () => {{ state[3] += 1.2; }};
+  document.getElementById("strongGust").onclick = () => {{ state[3] += (Math.random() > 0.5 ? 2.4 : -2.4); }};
+  document.getElementById("resetBtn").onclick = resetSim;
 
-        // Draw Centerline (Target Setpoint)
-        ctx.strokeStyle = "#eab308";
-        ctx.setLineDash([10, 10]);
-        ctx.beginPath();
-        for (let i = 0; i < data.x.length; i++) {{
-          const sx = toScreenX(data.x[i]);
-          const sy = toScreenY(data.ref[i]);
-          if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-        }}
-        ctx.stroke();
-        ctx.setLineDash([]);
+  function derivs(s, f) {{
+    const [x, xd, th, thd] = s;
+    const sinT = Math.sin(th);
+    const cosT = Math.cos(th);
+    const totalM = cfg.M + cfg.m;
+    const temp = (f + cfg.m * cfg.L * thd * thd * sinT) / totalM;
+    const thAcc = (g * sinT - cosT * temp) / (cfg.L * (4.0 / 3.0 - (cfg.m * cosT * cosT) / totalM));
+    const xAcc = temp - (cfg.m * cfg.L * thAcc * cosT) / totalM - 0.1 * xd;
+    return [xd, xAcc, thd, thAcc];
+  }}
 
-        // Draw Car Trail
-        ctx.strokeStyle = "#38bdf8";
-        ctx.lineWidth = 2.5;
-        ctx.beginPath();
-        for (let i = Math.max(0, idx - 80); i <= idx; i++) {{
-          const sx = toScreenX(data.x[i]);
-          const sy = toScreenY(data.y[i]);
-          if (i === Math.max(0, idx - 80)) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-        }}
-        ctx.stroke();
+  function rk4(s, f, h) {{
+    const k1 = derivs(s, f);
+    const s2 = s.map((v, i) => v + 0.5 * h * k1[i]);
+    const k2 = derivs(s2, f);
+    const s3 = s.map((v, i) => v + 0.5 * h * k2[i]);
+    const k3 = derivs(s3, f);
+    const s4 = s.map((v, i) => v + h * k3[i]);
+    const k4 = derivs(s4, f);
+    return s.map((v, i) => v + (h / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+  }}
 
-        // Draw Car Body
-        const cx = toScreenX(carX);
-        const cy = toScreenY(carY);
-        const offRoad = Math.abs(cte) > laneHalf;
+  function stepPhysics() {{
+    if (fallen) return;
 
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.rotate(-psi);
-        ctx.fillStyle = offRoad ? "#ef4444" : "#22c55e";
-        ctx.fillRect(-18, -9, 36, 18);
-        // Windshield
-        ctx.fillStyle = "#0f172a";
-        ctx.fillRect(4, -7, 8, 14);
-        ctx.restore();
+    const [x, xd, th, thd] = state;
 
-        // Update HUD
-        hud.innerHTML =
-          `Speed: <b>${{data.speed}} m/s</b> | ` +
-          `CTE (Error): <b style="color:${{offRoad ? '#ef4444' : '#22c55e'}}">${{cte.toFixed(2)}} m</b> | ` +
-          `Steer: <b>${{(steer * 57.3).toFixed(1)}}°</b> | ` +
-          `Wind: <b>${{data.wind}} m/s</b>`;
+    if (cfg.enabled) {{
+      integral = Math.max(-2.0, Math.min(2.0, integral + th * dt));
+      const uAngle = cfg.kp * th + cfg.ki * integral + cfg.kd * thd;
+      const uPos = 2.0 * x + 3.5 * xd;
+      force = Math.max(-50.0, Math.min(50.0, uAngle + uPos));
+    }} else {{
+      force = 0.0;
+    }}
 
-        if (playing) {{
-          idx = (idx + 1) % data.x.length;
-        }}
-        requestAnimationFrame(draw);
-      }}
+    state = rk4(state, force, dt);
 
-      draw();
-    </script>
-    """
-    components.html(html_canvas, height=490)
+    // Clamp cart to track limits
+    if (state[0] > trackLimit) {{ state[0] = trackLimit; state[1] *= -0.4; }}
+    if (state[0] < -trackLimit) {{ state[0] = -trackLimit; state[1] *= -0.4; }}
 
-with tab_diag:
-    t_axis = np.arange(len(sim["cte"])) * 0.05
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t_axis, y=sim["cte"], name="Cross-Track Error (m)", line=dict(color="#38bdf8")))
-    fig.add_hline(y=3.2, line_dash="dot", line_color="#ef4444", annotation_text="Road Edge (+3.2m)")
-    fig.add_hline(y=-3.2, line_dash="dot", line_color="#ef4444", annotation_text="Road Edge (-3.2m)")
-    fig.update_layout(
-        title="Closed-Loop Tracking Error Over Time (Unit II: Overshoot & Settling)",
-        xaxis_title="Time (seconds)",
-        yaxis_title="Error from Centerline (m)",
-        template="plotly_dark",
-        height=380,
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    simTime += dt;
+    angleHistory.push(state[2] * 57.2958);
+    if (angleHistory.length > 180) angleHistory.shift();
+
+    if (Math.abs(state[2]) > Math.PI / 2) {{
+      fallen = true;
+    }}
+  }}
+
+  function draw() {{
+    stepPhysics();
+
+    const W = canvas.width;
+    const H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // Subtle background grid
+    ctx.strokeStyle = "#1e293b";
+    ctx.lineWidth = 1;
+    for (let gx = 0; gx < W; gx += 40) {{
+      ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, H); ctx.stroke();
+    }}
+    for (let gy = 0; gy < H; gy += 40) {{
+      ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke();
+    }}
+
+    const originX = W / 2;
+    const trackY = H * 0.72;
+    const pxPerMeter = 160;
+
+    // Draw Track Rail
+    ctx.strokeStyle = "#475569";
+    ctx.lineWidth = 6;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(originX - trackLimit * pxPerMeter - 30, trackY + 26);
+    ctx.lineTo(originX + trackLimit * pxPerMeter + 30, trackY + 26);
+    ctx.stroke();
+
+    // Center marker (Setpoint x = 0)
+    ctx.strokeStyle = "#334155";
+    ctx.setLineDash([6, 6]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(originX, 40);
+    ctx.lineTo(originX, trackY + 40);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    const [x, xd, th, thd] = state;
+    const cartX = originX + x * pxPerMeter;
+    const cartW = 86;
+    const cartH = 42;
+
+    // Draw Force Vector Arrow
+    if (Math.abs(force) > 0.5 && !fallen) {{
+      const arrowLen = Math.max(-110, Math.min(110, force * 2.5));
+      ctx.strokeStyle = "#22c55e";
+      ctx.fillStyle = "#22c55e";
+      ctx.lineWidth = 4;
+      const startX = cartX + (arrowLen > 0 ? cartW / 2 + 6 : -cartW / 2 - 6);
+      const endX = startX + arrowLen;
+      ctx.beginPath();
+      ctx.moveTo(startX, trackY);
+      ctx.lineTo(endX, trackY);
+      ctx.stroke();
+
+      // Arrowhead
+      const dir = arrowLen > 0 ? 1 : -1;
+      ctx.beginPath();
+      ctx.moveTo(endX, trackY);
+      ctx.lineTo(endX - dir * 10, trackY - 6);
+      ctx.lineTo(endX - dir * 10, trackY + 6);
+      ctx.closePath();
+      ctx.fill();
+    }}
+
+    // Draw Cart Body
+    ctx.fillStyle = "#1e293b";
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.roundRect(cartX - cartW / 2, trackY - cartH / 2, cartW, cartH, 8);
+    ctx.fill();
+    ctx.stroke();
+
+    // Draw Wheels
+    ctx.fillStyle = "#94a3b8";
+    for (const wx of [cartX - 24, cartX + 24]) {{
+      ctx.beginPath();
+      ctx.arc(wx, trackY + cartH / 2 + 2, 10, 0, Math.PI * 2);
+      ctx.fill();
+    }}
+
+    // Draw Pole
+    const polePx = cfg.L * 2.0 * pxPerMeter;
+    const tipX = cartX + Math.sin(th) * polePx;
+    const tipY = trackY - Math.cos(th) * polePx;
+
+    // Pole shadow/glow
+    const deg = Math.abs(th * 57.2958);
+    const poleColor = fallen ? "#ef4444" : (deg < 5 ? "#22c55e" : (deg < 20 ? "#f59e0b" : "#ef4444"));
+
+    ctx.strokeStyle = "#e2e8f0";
+    ctx.lineWidth = 8;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(cartX, trackY);
+    ctx.lineTo(tipX, tipY);
+    ctx.stroke();
+
+    // Pivot Joint
+    ctx.fillStyle = "#38bdf8";
+    ctx.beginPath();
+    ctx.arc(cartX, trackY, 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Pole Tip Mass (Bob)
+    ctx.fillStyle = poleColor;
+    ctx.beginPath();
+    ctx.arc(tipX, tipY, 12 + cfg.m * 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Mini Live Oscilloscope (Top-Right inside Canvas)
+    const ox = W - 210, oy = 18, ow = 190, oh = 74;
+    ctx.fillStyle = "rgba(15, 23, 42, 0.85)";
+    ctx.strokeStyle = "#334155";
+    ctx.lineWidth = 1;
+    ctx.fillRect(ox, oy, ow, oh);
+    ctx.strokeRect(ox, oy, ow, oh);
+
+    // Zero line
+    ctx.strokeStyle = "#475569";
+    ctx.beginPath();
+    ctx.moveTo(ox, oy + oh / 2);
+    ctx.lineTo(ox + ow, oy + oh / 2);
+    ctx.stroke();
+
+    // Angle trace
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < angleHistory.length; i++) {{
+      const px = ox + (i / 180) * ow;
+      const py = oy + oh / 2 - Math.max(-35, Math.min(35, angleHistory[i])) * (oh / 75);
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }}
+    ctx.stroke();
+
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "10px monospace";
+    ctx.fillText("LIVE ANGLE (θ)", ox + 6, oy + 13);
+
+    // Update Telemetry HUD
+    elAngle.textContent = (th * 57.2958).toFixed(1) + "°";
+    elPos.textContent = x.toFixed(2) + " m";
+    elForce.textContent = force.toFixed(1) + " N";
+    elTime.textContent = simTime.toFixed(1) + " s";
+
+    if (fallen) {{
+      statusBadge.textContent = "✖ UNSTABLE / FALLEN";
+      statusBadge.style.background = "#7f1d1d";
+      statusBadge.style.color = "#fca5a5";
+    }} else if (deg < 5) {{
+      statusBadge.textContent = "● BALANCED";
+      statusBadge.style.background = "#065f46";
+      statusBadge.style.color = "#34d399";
+    }} else {{
+      statusBadge.textContent = "▲ RECOVERING";
+      statusBadge.style.background = "#78350f";
+      statusBadge.style.color = "#fcd34d";
+    }}
+
+    requestAnimationFrame(draw);
+  }}
+
+  draw();
+</script>
+"""
+
+components.html(html_code, height=600)
