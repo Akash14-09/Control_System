@@ -267,3 +267,401 @@ html_code = f"""
     <div class="metric-card">
       <div class="metric-label">Pole Angle (θ)</div>
       <div id="valAngle" class="metric-val" style="color:#38bdf8;">0.0°</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Cart Position (x)</div>
+      <div id="valPos" class="metric-val" style="color:#f8fafc;">0.00 m</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Control Force (F)</div>
+      <div id="valForce" class="metric-val" style="color:#22c55e;">0.0 N</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Balance Time</div>
+      <div id="valTime" class="metric-val" style="color:#f59e0b;">0.0 s</div>
+    </div>
+  </div>
+
+  <!-- Big Full-Width Live Oscilloscope -->
+  <div class="chart-header">
+    <span>📈 Live Closed-Loop Response (Real-Time Oscilloscope)</span>
+    <div class="legend">
+      <span><span class="dot" style="background:#38bdf8;"></span>Pole Angle θ (±45°)</span>
+      <span><span class="dot" style="background:#22c55e;"></span>Control Force F (±55 N)</span>
+      <span><span class="dot" style="background:#eab308;"></span>Setpoint (0°)</span>
+    </div>
+  </div>
+  <canvas id="scopeCanvas" width="1000" height="220" style="width:100%; background:#0f172a; border-radius:10px; display:block; border:1px solid #1e293b;"></canvas>
+</div>
+
+<script>
+  const cfg = {config};
+  const canvas = document.getElementById("pendulumCanvas");
+  const ctx = canvas.getContext("2d");
+  const scope = document.getElementById("scopeCanvas");
+  const sctx = scope.getContext("2d");
+
+  const elAngle = document.getElementById("valAngle");
+  const elPos = document.getElementById("valPos");
+  const elForce = document.getElementById("valForce");
+  const elTime = document.getElementById("valTime");
+  const statusBadge = document.getElementById("statusBadge");
+
+  // State: [x, x_dot, theta, theta_dot]
+  let state = [0.0, 0.0, 0.12, 0.0];
+  let integral = 0.0;
+  let force = 0.0;
+  let simTime = 0.0;
+  let fallen = false;
+  let paused = false;
+  let slowMo = false;
+  let windOn = false;
+  let wheelAngle = 0.0;
+
+  const maxHist = 360;
+  let angleHist = [];
+  let forceHist = [];
+
+  const g = 9.81;
+  const baseDt = 0.016;
+  const trackLimit = 2.6;
+
+  function resetSim() {{
+    state = [0.0, 0.0, 0.12, 0.0];
+    integral = 0.0;
+    force = 0.0;
+    simTime = 0.0;
+    fallen = false;
+    angleHist = [];
+    forceHist = [];
+  }}
+
+  document.getElementById("pushLeft").onclick = () => {{ state[3] -= 1.5; }};
+  document.getElementById("pushRight").onclick = () => {{ state[3] += 1.5; }};
+  document.getElementById("strongGust").onclick = () => {{
+    state[3] += (Math.random() > 0.5 ? 3.2 : -3.2);
+  }};
+  document.getElementById("windBtn").onclick = (e) => {{
+    windOn = !windOn;
+    e.target.textContent = windOn ? "💨 Wind: ON" : "💨 Wind: OFF";
+    e.target.style.background = windOn ? "#ec4899" : "#7c3aed";
+  }};
+  document.getElementById("slowBtn").onclick = (e) => {{
+    slowMo = !slowMo;
+    e.target.textContent = slowMo ? "🐢 0.4x" : "🐢 1.0x";
+  }};
+  document.getElementById("pauseBtn").onclick = (e) => {{
+    paused = !paused;
+    e.target.textContent = paused ? "▶ Resume" : "⏸ Pause";
+  }};
+  document.getElementById("resetBtn").onclick = resetSim;
+
+  function derivs(s, f) {{
+    const [x, xd, th, thd] = s;
+    const sinT = Math.sin(th);
+    const cosT = Math.cos(th);
+    const totalM = cfg.M + cfg.m;
+    const windTorque = windOn ? 2.2 * Math.cos(th) : 0.0;
+    const temp = (f + cfg.m * cfg.L * thd * thd * sinT) / totalM;
+    const thAcc = (g * sinT - cosT * temp + windTorque) / (cfg.L * (4.0 / 3.0 - (cfg.m * cosT * cosT) / totalM));
+    const xAcc = temp - (cfg.m * cfg.L * thAcc * cosT) / totalM - 0.1 * xd;
+    return [xd, xAcc, thd, thAcc];
+  }}
+
+  function rk4(s, f, h) {{
+    const k1 = derivs(s, f);
+    const s2 = s.map((v, i) => v + 0.5 * h * k1[i]);
+    const k2 = derivs(s2, f);
+    const s3 = s.map((v, i) => v + 0.5 * h * k2[i]);
+    const k3 = derivs(s3, f);
+    const s4 = s.map((v, i) => v + h * k3[i]);
+    const k4 = derivs(s4, f);
+    return s.map((v, i) => v + (h / 6.0) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+  }}
+
+  function stepPhysics() {{
+    if (paused) return;
+    const dt = slowMo ? baseDt * 0.4 : baseDt;
+    const [x, xd, th, thd] = state;
+
+    if (cfg.enabled && !fallen) {{
+      integral = Math.max(-2.0, Math.min(2.0, integral + th * dt));
+      const uAngle = cfg.kp * th + cfg.ki * integral + cfg.kd * thd;
+      const uPos = 2.0 * x + 3.5 * xd;
+      force = Math.max(-55.0, Math.min(55.0, uAngle + uPos));
+    }} else {{
+      force = 0.0;
+    }}
+
+    state = rk4(state, force, dt);
+    wheelAngle += state[1] * dt * 8.0;
+
+    if (state[0] > trackLimit) {{ state[0] = trackLimit; state[1] *= -0.45; }}
+    if (state[0] < -trackLimit) {{ state[0] = -trackLimit; state[1] *= -0.45; }}
+
+    // Let pole hit the horizontal rail if it falls past 92 deg
+    if (Math.abs(state[2]) > 1.60) {{
+      fallen = true;
+      state[2] = Math.sign(state[2]) * 1.60;
+      state[3] *= -0.25;
+    }} else if (!fallen) {{
+      simTime += dt;
+    }}
+
+    angleHist.push(state[2] * 57.2958);
+    forceHist.push(force);
+    if (angleHist.length > maxHist) {{
+      angleHist.shift();
+      forceHist.shift();
+    }}
+  }}
+
+  function drawPendulum() {{
+    const W = canvas.width;
+    const H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // Grid
+    ctx.strokeStyle = "#162033";
+    ctx.lineWidth = 1;
+    for (let gx = 0; gx < W; gx += 40) {{
+      ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, H); ctx.stroke();
+    }}
+    for (let gy = 0; gy < H; gy += 40) {{
+      ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke();
+    }}
+
+    const originX = W / 2;
+    const trackY = H * 0.74;
+    const pxPerMeter = 165;
+
+    // Wind visual streaks
+    if (windOn) {{
+      ctx.strokeStyle = "rgba(236, 72, 153, 0.35)";
+      ctx.lineWidth = 2;
+      const offset = (Date.now() * 0.3) % 120;
+      for (let wy = 50; wy < trackY - 20; wy += 45) {{
+        for (let wx = -120; wx < W; wx += 120) {{
+          ctx.beginPath();
+          ctx.moveTo(wx + offset, wy);
+          ctx.lineTo(wx + offset + 45, wy);
+          ctx.stroke();
+        }}
+      }}
+    }}
+
+    // Track Rail & Meter Ticks
+    const leftEdge = originX - trackLimit * pxPerMeter;
+    const rightEdge = originX + trackLimit * pxPerMeter;
+    ctx.strokeStyle = "#475569";
+    ctx.lineWidth = 7;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(leftEdge - 25, trackY + 28);
+    ctx.lineTo(rightEdge + 25, trackY + 28);
+    ctx.stroke();
+
+    ctx.fillStyle = "#64748b";
+    ctx.font = "11px monospace";
+    ctx.textAlign = "center";
+    for (let m = -2; m <= 2; m++) {{
+      const tx = originX + m * pxPerMeter;
+      ctx.fillRect(tx - 1, trackY + 28, 2, 8);
+      ctx.fillText(m + "m", tx, trackY + 50);
+    }}
+
+    // Center Reference Line
+    ctx.strokeStyle = "rgba(234, 179, 8, 0.35)";
+    ctx.setLineDash([6, 6]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(originX, 25);
+    ctx.lineTo(originX, trackY + 25);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    const [x, xd, th, thd] = state;
+    const cartX = originX + x * pxPerMeter;
+    const cartW = 92;
+    const cartH = 44;
+
+    // Force Vector Arrow
+    if (Math.abs(force) > 0.5 && !fallen) {{
+      const arrowLen = Math.max(-130, Math.min(130, force * 2.4));
+      ctx.strokeStyle = "#22c55e";
+      ctx.fillStyle = "#22c55e";
+      ctx.lineWidth = 5;
+      const startX = cartX + (arrowLen > 0 ? cartW / 2 + 8 : -cartW / 2 - 8);
+      const endX = startX + arrowLen;
+      ctx.beginPath();
+      ctx.moveTo(startX, trackY);
+      ctx.lineTo(endX, trackY);
+      ctx.stroke();
+
+      const dir = arrowLen > 0 ? 1 : -1;
+      ctx.beginPath();
+      ctx.moveTo(endX, trackY);
+      ctx.lineTo(endX - dir * 12, trackY - 7);
+      ctx.lineTo(endX - dir * 12, trackY + 7);
+      ctx.closePath();
+      ctx.fill();
+    }}
+
+    // Cart Body
+    ctx.fillStyle = fallen ? "#450a0a" : "#1e293b";
+    ctx.strokeStyle = fallen ? "#ef4444" : "#38bdf8";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.roundRect(cartX - cartW / 2, trackY - cartH / 2, cartW, cartH, 9);
+    ctx.fill();
+    ctx.stroke();
+
+    // Rotating Wheels
+    for (const wx of [cartX - 26, cartX + 26]) {{
+      const wy = trackY + cartH / 2 + 2;
+      ctx.fillStyle = "#94a3b8";
+      ctx.beginPath();
+      ctx.arc(wx, wy, 10, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#0f172a";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(wx + Math.cos(wheelAngle) * 8, wy + Math.sin(wheelAngle) * 8);
+      ctx.lineTo(wx - Math.cos(wheelAngle) * 8, wy - Math.sin(wheelAngle) * 8);
+      ctx.stroke();
+    }}
+
+    // Angle Arc at Pivot
+    ctx.strokeStyle = "rgba(56, 189, 248, 0.5)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const startA = -Math.PI / 2;
+    const endA = -Math.PI / 2 + th;
+    ctx.arc(cartX, trackY, 42, Math.min(startA, endA), Math.max(startA, endA));
+    ctx.stroke();
+
+    // Pole
+    const polePx = cfg.L * 2.0 * pxPerMeter;
+    const tipX = cartX + Math.sin(th) * polePx;
+    const tipY = trackY - Math.cos(th) * polePx;
+
+    const deg = Math.abs(th * 57.2958);
+    const poleColor = fallen ? "#ef4444" : (deg < 5 ? "#22c55e" : (deg < 20 ? "#f59e0b" : "#ef4444"));
+
+    ctx.strokeStyle = "#e2e8f0";
+    ctx.lineWidth = 9;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(cartX, trackY);
+    ctx.lineTo(tipX, tipY);
+    ctx.stroke();
+
+    // Pivot
+    ctx.fillStyle = "#38bdf8";
+    ctx.beginPath();
+    ctx.arc(cartX, trackY, 7, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Pole Tip Mass
+    ctx.shadowColor = poleColor;
+    ctx.shadowBlur = 14;
+    ctx.fillStyle = poleColor;
+    ctx.beginPath();
+    ctx.arc(tipX, tipY, 12 + cfg.m * 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Update Telemetry
+    elAngle.textContent = (th * 57.2958).toFixed(1) + "°";
+    elPos.textContent = x.toFixed(2) + " m";
+    elForce.textContent = force.toFixed(1) + " N";
+    elTime.textContent = simTime.toFixed(1) + " s";
+
+    if (!cfg.enabled) {{
+      statusBadge.textContent = "⚫ OPEN-LOOP (CONTROLLER OFF)";
+      statusBadge.style.background = "#334155";
+      statusBadge.style.color = "#e2e8f0";
+    }} else if (fallen) {{
+      statusBadge.textContent = "✖ UNSTABLE / FALLEN";
+      statusBadge.style.background = "#7f1d1d";
+      statusBadge.style.color = "#fca5a5";
+    }} else if (deg < 5) {{
+      statusBadge.textContent = "● BALANCED";
+      statusBadge.style.background = "#065f46";
+      statusBadge.style.color = "#34d399";
+    }} else {{
+      statusBadge.textContent = "▲ RECOVERING";
+      statusBadge.style.background = "#78350f";
+      statusBadge.style.color = "#fcd34d";
+    }}
+  }}
+
+  function drawScope() {{
+    const W = scope.width;
+    const H = scope.height;
+    sctx.clearRect(0, 0, W, H);
+
+    // Horizontal Grid Lines
+    sctx.strokeStyle = "#1e293b";
+    sctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {{
+      const gy = (H / 4) * i;
+      sctx.beginPath(); sctx.moveTo(0, gy); sctx.lineTo(W, gy); sctx.stroke();
+    }}
+    // Vertical Grid Lines
+    for (let gx = 0; gx < W; gx += 60) {{
+      sctx.beginPath(); sctx.moveTo(gx, 0); sctx.lineTo(gx, H); sctx.stroke();
+    }}
+
+    // Zero Setpoint Line
+    sctx.strokeStyle = "rgba(234, 179, 8, 0.55)";
+    sctx.setLineDash([6, 6]);
+    sctx.lineWidth = 1.5;
+    sctx.beginPath();
+    sctx.moveTo(0, H / 2);
+    sctx.lineTo(W, H / 2);
+    sctx.stroke();
+    sctx.setLineDash([]);
+
+    // Y-Axis Labels
+    sctx.fillStyle = "#64748b";
+    sctx.font = "11px monospace";
+    sctx.fillText("+45°", 8, 16);
+    sctx.fillText("0° (Setpoint)", 8, H / 2 - 5);
+    sctx.fillText("-45°", 8, H - 8);
+
+    // Plot Control Force (Green)
+    sctx.strokeStyle = "rgba(34, 197, 94, 0.75)";
+    sctx.lineWidth = 2;
+    sctx.beginPath();
+    for (let i = 0; i < forceHist.length; i++) {{
+      const px = (i / (maxHist - 1)) * W;
+      const py = H / 2 - Math.max(-55, Math.min(55, forceHist[i])) * (H / 120);
+      if (i === 0) sctx.moveTo(px, py); else sctx.lineTo(px, py);
+    }}
+    sctx.stroke();
+
+    // Plot Pole Angle (Cyan)
+    sctx.strokeStyle = "#38bdf8";
+    sctx.lineWidth = 2.8;
+    sctx.beginPath();
+    for (let i = 0; i < angleHist.length; i++) {{
+      const px = (i / (maxHist - 1)) * W;
+      const py = H / 2 - Math.max(-45, Math.min(45, angleHist[i])) * (H / 98);
+      if (i === 0) sctx.moveTo(px, py); else sctx.lineTo(px, py);
+    }}
+    sctx.stroke();
+  }}
+
+  function loop() {{
+    stepPhysics();
+    drawPendulum();
+    drawScope();
+    requestAnimationFrame(loop);
+  }}
+
+  loop();
+</script>
+"""
+
+components.html(html_code, height=790)
