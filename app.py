@@ -1,302 +1,316 @@
-import os
-import joblib
+import json
 import numpy as np
-import pandas as pd
-import lightgbm as lgb
-import control as ctrl
+from scipy.optimize import minimize
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
-# --- Page Config ---
 st.set_page_config(
-    page_title="Predictive Cloud Auto-Scaler | Control Systems",
-    page_icon="⚡",
+    page_title="2D Self-Driving Car | Control Systems",
+    page_icon="🚗",
     layout="wide",
 )
 
-# --- Data & ML Model ---
-def generate_traffic(n_steps=600, scenario="Flash Sale (Step + Ramp)", seed=42):
-    rng = np.random.default_rng(seed)
-    t = np.arange(n_steps)
-    base = 500 + 200 * np.sin(2 * np.pi * t / 300) + 60 * np.sin(2 * np.pi * t / 75)
-    noise = rng.normal(0, 18, n_steps)
-    traffic = np.clip(base + noise, 100, None)
-
-    if scenario == "Flash Sale (Step + Ramp)":
-        traffic[150:280] += 480
-        traffic[360:440] += np.linspace(0, 520, 80)
-    elif scenario == "DDoS / Sudden Burst (Impulse)":
-        traffic[180:215] += 850
-        traffic[380:415] += 700
-    elif scenario == "Gradual Evening Peak (Ramp)":
-        traffic[120:350] += np.linspace(0, 600, 230)
-        traffic[350:500] += np.linspace(600, 0, 150)
-
-    return traffic
+# --- Session State for PID Gains ---
+if "kp" not in st.session_state:
+    st.session_state.kp = 0.15
+if "ki" not in st.session_state:
+    st.session_state.ki = 0.01
+if "kd" not in st.session_state:
+    st.session_state.kd = 0.25
 
 
-def build_features(traffic_series):
-    df = pd.DataFrame({"traffic": traffic_series})
-    for lag in [1, 2, 3, 6, 12]:
-        df[f"lag_{lag}"] = df["traffic"].shift(lag)
-    df["roll_mean_6"] = df["traffic"].rolling(6).mean()
-    df["roll_std_6"] = df["traffic"].rolling(6).std()
-    df["diff_1"] = df["traffic"].diff(1)
-    return df
+# --- Track & Kinematic Bicycle Physics ---
+def road_center_y(x, track_type):
+    if track_type == "S-Curves (Highway)":
+        return 6.0 * np.sin(0.035 * x) + 2.5 * np.sin(0.08 * x)
+    elif track_type == "Sharp Chicane":
+        return 8.0 * np.sin(0.055 * x)
+    else:  # Step Lane Change (Unit II: Step Input)
+        return np.where(x > 40.0, 5.0, 0.0)
 
 
-@st.cache_resource
-def load_or_train_model():
-    if os.path.exists("traffic_forecaster.pkl"):
-        return joblib.load("traffic_forecaster.pkl")
+def simulate_car(kp, ki, kd, speed, friction, wind, track_type, steps=400, dt=0.05):
+    L = 2.5  # Wheelbase (meters)
+    max_steer = np.radians(32)
+    lane_half_width = 3.2
 
-    # Fallback: train a fast LightGBM model on synthetic history
-    hist = generate_traffic(n_steps=2000, scenario="Flash Sale (Step + Ramp)", seed=42)
-    df = build_features(hist)
-    df["target"] = df["traffic"].shift(-3)
-    df = df.dropna().reset_index(drop=True)
-
-    features = [c for c in df.columns if c not in ["traffic", "target"]]
-    model = lgb.LGBMRegressor(
-        n_estimators=150, learning_rate=0.05, max_depth=5, verbose=-1, random_state=42
-    )
-    model.fit(df[features], df["target"])
-    return model
-
-
-# --- Control Loop Simulation ---
-def run_simulation(
-    traffic_series,
-    ml_preds,
-    mode="pid",
-    Kp=0.04,
-    Ki=0.008,
-    Kd=0.01,
-    target_cpu=70.0,
-    boot_delay=3,
-    cap_per_server=100.0,
-):
-    n = len(traffic_series)
-    active_servers = np.zeros(n)
-    cpu_load = np.zeros(n)
-
-    server_pipeline = [8.0] * (boot_delay + 1)
+    x, y, psi = 0.0, 0.0, 0.0
     integral_err = 0.0
-    prev_err = 0.0
+    prev_err = road_center_y(0.0, track_type) - y
 
-    for t in range(n):
-        current_servers = max(1.0, server_pipeline.pop(0))
-        active_servers[t] = current_servers
+    xs, ys, psis, steers, ctes, refs = [], [], [], [], [], []
+    off_road_steps = 0
 
-        cpu = (traffic_series[t] / (current_servers * cap_per_server)) * 100.0
-        cpu_load[t] = cpu
-        error = cpu - target_cpu
+    for _ in range(steps):
+        y_ref = float(road_center_y(x, track_type))
+        cte = y_ref - y  # Cross-Track Error (Negative Feedback)
 
-        if mode == "rule_based":
-            if cpu > 80:
-                next_servers = current_servers + 2
-            elif cpu < 50:
-                next_servers = current_servers - 1
-            else:
-                next_servers = current_servers
+        integral_err = np.clip(integral_err + cte * dt, -15.0, 15.0)
+        deriv_err = (cte - prev_err) / dt
+        prev_err = cte
 
-        elif mode == "pid":
-            integral_err = np.clip(integral_err + error, -200, 200)
-            derivative_err = error - prev_err
-            u = (Kp * error) + (Ki * integral_err) + (Kd * derivative_err)
-            next_servers = current_servers + u
-            prev_err = error
+        # PID Steering Controller (Unit II)
+        raw_steer = kp * cte + ki * integral_err + kd * deriv_err
+        steer = float(np.clip(raw_steer, -max_steer, max_steer))
 
-        elif mode == "ml_pid":
-            integral_err = np.clip(integral_err + error, -200, 200)
-            derivative_err = error - prev_err
-            u_pid = (Kp * error) + (Ki * integral_err) + (Kd * derivative_err)
+        # Road friction limits effective turning grip
+        effective_steer = steer * friction
 
-            req_servers = ml_preds[t] / (cap_per_server * (target_cpu / 100.0))
-            u_ff = 0.5 * (req_servers - current_servers)
-            next_servers = current_servers + u_pid + u_ff
-            prev_err = error
+        # Kinematic update + crosswind disturbance
+        x += speed * np.cos(psi) * dt
+        y += (speed * np.sin(psi) + wind) * dt
+        psi += (speed / L) * np.tan(effective_steer) * dt
+        psi = float(np.clip(psi, -np.pi / 2.2, np.pi / 2.2))
 
-        server_pipeline.append(max(1.0, next_servers))
+        if abs(cte) > lane_half_width:
+            off_road_steps += 1
 
-    return cpu_load, active_servers
+        xs.append(round(x, 3))
+        ys.append(round(y, 3))
+        psis.append(round(psi, 4))
+        steers.append(round(steer, 4))
+        ctes.append(round(cte, 3))
+        refs.append(round(y_ref, 3))
+
+    return {
+        "x": xs,
+        "y": ys,
+        "psi": psis,
+        "steer": steers,
+        "cte": ctes,
+        "ref": refs,
+        "off_road": off_road_steps,
+        "max_err": float(np.max(np.abs(ctes))),
+        "mae": float(np.mean(np.abs(ctes))),
+    }
 
 
-def compute_metrics(cpu, srv, target_cpu=70.0):
-    overshoot = max(0.0, float(np.max(cpu) - target_cpu))
-    sla_breaches = int(np.sum(cpu > 95.0))
-    mae_err = float(np.mean(np.abs(cpu - target_cpu)))
-    cost_inr = float(np.sum(srv) * 0.5)  # ₹0.50 per server-step
-    return overshoot, sla_breaches, mae_err, cost_inr
+def ai_auto_tune(speed, friction, wind, track_type):
+    """Minimizes ITAE + crash penalty to find optimal PID gains."""
+    def loss_fn(params):
+        kp, ki, kd = params
+        if kp < 0 or ki < 0 or kd < 0 or kp > 2.0 or ki > 1.0 or kd > 2.0:
+            return 1e6
+        res = simulate_car(kp, ki, kd, speed, friction, wind, track_type, steps=300)
+        cte = np.array(res["cte"])
+        t = np.arange(len(cte)) * 0.05
+        itae = np.mean(t * np.abs(cte))
+        crash_penalty = res["off_road"] * 2.5
+        return float(itae + crash_penalty)
+
+    result = minimize(
+        loss_fn,
+        x0=[0.25, 0.05, 0.35],
+        method="Nelder-Mead",
+        options={"maxiter": 120},
+    )
+    kp, ki, kd = np.clip(result.x, [0.01, 0.0, 0.0], [1.5, 0.5, 1.5])
+    return round(float(kp), 3), round(float(ki), 3), round(float(kd), 3)
 
 
 # --- Sidebar Controls ---
-st.sidebar.header("Control Center")
-
-scenario = st.sidebar.selectbox(
-    "Traffic Disturbance Scenario",
-    [
-        "Flash Sale (Step + Ramp)",
-        "DDoS / Sudden Burst (Impulse)",
-        "Gradual Evening Peak (Ramp)",
-        "Normal Day",
-    ],
+st.sidebar.header("🚗 Environment & Disturbances")
+track_type = st.sidebar.selectbox(
+    "Track Profile",
+    ["S-Curves (Highway)", "Sharp Chicane", "Step Lane Change (Unit II)"],
 )
+speed = st.sidebar.slider("Car Speed (m/s)", 8.0, 28.0, 16.0, step=1.0)
 
-target_cpu = st.sidebar.slider("Setpoint CPU (%)", 50, 85, 70)
-boot_delay = st.sidebar.slider("Server Boot Delay (x10s)", 1, 6, 3)
+road_surface = st.sidebar.selectbox(
+    "Road Condition (Friction)",
+    ["Dry Asphalt (1.0)", "Wet / Rainy (0.65)", "Icy Road (0.35)"],
+)
+friction_map = {"Dry Asphalt (1.0)": 1.0, "Wet / Rainy (0.65)": 0.65, "Icy Road (0.35)": 0.35}
+friction = friction_map[road_surface]
 
-st.sidebar.subheader("PID Gains (Unit II)")
-Kp = st.sidebar.slider("Proportional (Kp)", 0.005, 0.120, 0.040, step=0.005, format="%.3f")
-Ki = st.sidebar.slider("Integral (Ki)", 0.000, 0.030, 0.008, step=0.002, format="%.3f")
-Kd = st.sidebar.slider("Derivative (Kd)", 0.000, 0.050, 0.010, step=0.005, format="%.3f")
+wind = st.sidebar.slider("Crosswind Disturbance (m/s)", -2.5, 2.5, 0.0, step=0.25)
 
-enable_ml = st.sidebar.toggle("Enable ML Feedforward Predictor", value=True)
+st.sidebar.divider()
+st.sidebar.header("🎛️ PID Steering Controller")
 
-# --- Run Pipeline ---
-model = load_or_train_model()
-raw_traffic = generate_traffic(n_steps=500, scenario=scenario, seed=99)
-df_feat = build_features(raw_traffic).dropna().reset_index(drop=True)
-feature_cols = [c for c in df_feat.columns if c != "traffic"]
+if st.sidebar.button("🤖 AI Auto-Tune PID", type="primary", use_container_width=True):
+    with st.spinner("Optimizing PID gains for current road & wind..."):
+        best_kp, best_ki, best_kd = ai_auto_tune(speed, friction, wind, track_type)
+        st.session_state.kp = best_kp
+        st.session_state.ki = best_ki
+        st.session_state.kd = best_kd
+    st.sidebar.success(f"Tuned! Kp={best_kp}, Ki={best_ki}, Kd={best_kd}")
 
-traffic = df_feat["traffic"].values
-ml_preds = model.predict(df_feat[feature_cols])
+kp = st.sidebar.slider("Proportional (Kp)", 0.01, 1.50, float(st.session_state.kp), step=0.01, key="kp")
+ki = st.sidebar.slider("Integral (Ki)", 0.00, 0.50, float(st.session_state.ki), step=0.01, key="ki")
+kd = st.sidebar.slider("Derivative (Kd)", 0.00, 1.50, float(st.session_state.kd), step=0.01, key="kd")
 
-cpu_rule, srv_rule = run_simulation(traffic, ml_preds, "rule_based", Kp, Ki, Kd, target_cpu, boot_delay)
-cpu_pid, srv_pid = run_simulation(traffic, ml_preds, "pid", Kp, Ki, Kd, target_cpu, boot_delay)
-cpu_ml, srv_ml = run_simulation(traffic, ml_preds, "ml_pid", Kp, Ki, Kd, target_cpu, boot_delay)
+# --- Run Simulation ---
+sim = simulate_car(kp, ki, kd, speed, friction, wind, track_type)
 
-active_cpu, active_srv = (cpu_ml, srv_ml) if enable_ml else (cpu_pid, srv_pid)
-active_label = "ML + PID" if enable_ml else "Pure PID"
-
-ov_act, sla_act, err_act, cost_act = compute_metrics(active_cpu, active_srv, target_cpu)
-ov_rul, sla_rul, err_rul, cost_rul = compute_metrics(cpu_rule, srv_rule, target_cpu)
-
-# --- Header & KPI Cards ---
-st.title("⚡ Predictive Cloud Server Auto-Scaler")
-st.caption("Closed-Loop PID Feedback + LightGBM Feedforward Compensation for Server Provisioning")
+# --- Header & KPIs ---
+st.title("🚗 2D Self-Driving Car: Lane-Keeping Control Simulator")
+st.caption("Closed-Loop PID Steering + AI Auto-Tuner under Real-Time Road & Wind Disturbances")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric(
-    f"SLA Breaches ({active_label})",
-    f"{sla_act}",
-    delta=f"{sla_act - sla_rul} vs Rule-Based",
-    delta_color="inverse",
-)
-c2.metric(
-    "Max CPU Overshoot",
-    f"{ov_act:.1f}%",
-    delta=f"{ov_act - ov_rul:.1f}% vs Rule-Based",
-    delta_color="inverse",
-)
-c3.metric(
-    "Avg Tracking Error",
-    f"{err_act:.1f}%",
-    delta=f"{err_act - err_rul:.1f}% vs Rule-Based",
-    delta_color="inverse",
-)
-c4.metric(
-    "Estimated Cloud Cost",
-    f"₹{cost_act:,.0f}",
-    delta=f"₹{cost_act - cost_rul:,.0f} vs Rule-Based",
-    delta_color="inverse",
-)
+status = "✅ STABLE" if sim["off_road"] == 0 else "🚨 OFF-ROAD / UNSTABLE"
+c1.metric("Driving Status", status)
+c2.metric("Max Lane Deviation", f"{sim['max_err']:.2f} m", help="Road edge is at 3.20 m")
+c3.metric("Avg Tracking Error", f"{sim['mae']:.2f} m")
+c4.metric("Off-Road Frames", f"{sim['off_road']}")
 
-# --- Tabs ---
-tab1, tab2, tab3 = st.tabs(
-    ["📈 Live Simulation", "🤖 ML Traffic Forecast", "📐 Stability & Bode Analysis (Units III–IV)"]
-)
+# --- Main Tabs ---
+tab_sim, tab_diag = st.tabs(["🎮 Live 2D Driving Simulator", "📊 Control Diagnostics (Unit II & III)"])
 
-time_axis = np.arange(len(traffic)) * 10  # seconds
+with tab_sim:
+    sim_json = json.dumps({
+        "x": sim["x"],
+        "y": sim["y"],
+        "psi": sim["psi"],
+        "steer": sim["steer"],
+        "cte": sim["cte"],
+        "ref": sim["ref"],
+        "wind": wind,
+        "speed": speed,
+    })
 
-with tab1:
-    # Chart 1: CPU Utilization
-    fig_cpu = go.Figure()
-    fig_cpu.add_trace(
-        go.Scatter(x=time_axis, y=cpu_rule, name="Rule-Based", line=dict(dash="dash", color="#94a3b8"))
-    )
-    fig_cpu.add_trace(
-        go.Scatter(x=time_axis, y=cpu_pid, name="Classical PID", line=dict(color="#38bdf8"))
-    )
-    if enable_ml:
-        fig_cpu.add_trace(
-            go.Scatter(x=time_axis, y=cpu_ml, name="ML Feedforward + PID", line=dict(color="#22c55e", width=2.5))
-        )
-    fig_cpu.add_hline(y=target_cpu, line_dash="dot", line_color="#eab308", annotation_text=f"Setpoint ({target_cpu}%)")
-    fig_cpu.add_hline(y=95, line_dash="dot", line_color="#ef4444", annotation_text="Crash Limit (95%)")
-    fig_cpu.update_layout(
-        title="CPU Utilization Response",
+    html_canvas = f"""
+    <div style="background:#0f172a; border-radius:12px; padding:12px; font-family:sans-serif; color:#e2e8f0;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <div>
+          <button id="playBtn" style="background:#22c55e; color:#000; border:none; padding:6px 14px; border-radius:6px; font-weight:bold; cursor:pointer;">⏸ Pause</button>
+          <button id="resetBtn" style="background:#334155; color:#fff; border:none; padding:6px 14px; border-radius:6px; margin-left:6px; cursor:pointer;">↺ Restart</button>
+        </div>
+        <div id="hud" style="font-size:14px; font-family:monospace;">Initializing...</div>
+      </div>
+      <canvas id="simCanvas" width="960" height="420" style="width:100%; background:#1e293b; border-radius:8px; display:block;"></canvas>
+    </div>
+
+    <script>
+      const data = {sim_json};
+      const canvas = document.getElementById("simCanvas");
+      const ctx = canvas.getContext("2d");
+      const hud = document.getElementById("hud");
+      const playBtn = document.getElementById("playBtn");
+      const resetBtn = document.getElementById("resetBtn");
+
+      let idx = 0;
+      let playing = true;
+      const scale = 14; // pixels per meter
+      const laneHalf = 3.2;
+
+      playBtn.onclick = () => {{
+        playing = !playing;
+        playBtn.textContent = playing ? "⏸ Pause" : "▶ Play";
+      }};
+      resetBtn.onclick = () => {{ idx = 0; playing = true; playBtn.textContent = "⏸ Pause"; }};
+
+      function draw() {{
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        const carX = data.x[idx];
+        const carY = data.y[idx];
+        const psi = data.psi[idx];
+        const cte = data.cte[idx];
+        const steer = data.steer[idx];
+
+        // Camera follows carX
+        const camX = carX - 18;
+        const toScreenX = (wx) => (wx - camX) * scale;
+        const toScreenY = (wy) => canvas.height / 2 - wy * scale;
+
+        // Draw Road Surface
+        ctx.beginPath();
+        for (let i = 0; i < data.x.length; i++) {{
+          const sx = toScreenX(data.x[i]);
+          const sy = toScreenY(data.ref[i] + laneHalf);
+          if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+        }}
+        for (let i = data.x.length - 1; i >= 0; i--) {{
+          const sx = toScreenX(data.x[i]);
+          const sy = toScreenY(data.ref[i] - laneHalf);
+          ctx.lineTo(sx, sy);
+        }}
+        ctx.closePath();
+        ctx.fillStyle = "#334155";
+        ctx.fill();
+
+        // Draw Road Borders
+        ctx.strokeStyle = "#f8fafc";
+        ctx.lineWidth = 2;
+        for (const offset of [laneHalf, -laneHalf]) {{
+          ctx.beginPath();
+          for (let i = 0; i < data.x.length; i++) {{
+            const sx = toScreenX(data.x[i]);
+            const sy = toScreenY(data.ref[i] + offset);
+            if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+          }}
+          ctx.stroke();
+        }}
+
+        // Draw Centerline (Target Setpoint)
+        ctx.strokeStyle = "#eab308";
+        ctx.setLineDash([10, 10]);
+        ctx.beginPath();
+        for (let i = 0; i < data.x.length; i++) {{
+          const sx = toScreenX(data.x[i]);
+          const sy = toScreenY(data.ref[i]);
+          if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+        }}
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Draw Car Trail
+        ctx.strokeStyle = "#38bdf8";
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        for (let i = Math.max(0, idx - 80); i <= idx; i++) {{
+          const sx = toScreenX(data.x[i]);
+          const sy = toScreenY(data.y[i]);
+          if (i === Math.max(0, idx - 80)) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+        }}
+        ctx.stroke();
+
+        // Draw Car Body
+        const cx = toScreenX(carX);
+        const cy = toScreenY(carY);
+        const offRoad = Math.abs(cte) > laneHalf;
+
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(-psi);
+        ctx.fillStyle = offRoad ? "#ef4444" : "#22c55e";
+        ctx.fillRect(-18, -9, 36, 18);
+        // Windshield
+        ctx.fillStyle = "#0f172a";
+        ctx.fillRect(4, -7, 8, 14);
+        ctx.restore();
+
+        // Update HUD
+        hud.innerHTML =
+          `Speed: <b>${{data.speed}} m/s</b> | ` +
+          `CTE (Error): <b style="color:${{offRoad ? '#ef4444' : '#22c55e'}}">${{cte.toFixed(2)}} m</b> | ` +
+          `Steer: <b>${{(steer * 57.3).toFixed(1)}}°</b> | ` +
+          `Wind: <b>${{data.wind}} m/s</b>`;
+
+        if (playing) {{
+          idx = (idx + 1) % data.x.length;
+        }}
+        requestAnimationFrame(draw);
+      }}
+
+      draw();
+    </script>
+    """
+    components.html(html_canvas, height=490)
+
+with tab_diag:
+    t_axis = np.arange(len(sim["cte"])) * 0.05
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=t_axis, y=sim["cte"], name="Cross-Track Error (m)", line=dict(color="#38bdf8")))
+    fig.add_hline(y=3.2, line_dash="dot", line_color="#ef4444", annotation_text="Road Edge (+3.2m)")
+    fig.add_hline(y=-3.2, line_dash="dot", line_color="#ef4444", annotation_text="Road Edge (-3.2m)")
+    fig.update_layout(
+        title="Closed-Loop Tracking Error Over Time (Unit II: Overshoot & Settling)",
         xaxis_title="Time (seconds)",
-        yaxis_title="CPU Load (%)",
-        height=400,
+        yaxis_title="Error from Centerline (m)",
         template="plotly_dark",
+        height=380,
     )
-    st.plotly_chart(fig_cpu, use_container_width=True)
-
-    # Chart 2: Active Servers
-    fig_srv = go.Figure()
-    fig_srv.add_trace(go.Scatter(x=time_axis, y=srv_rule, name="Rule-Based", line=dict(dash="dash", color="#94a3b8")))
-    fig_srv.add_trace(go.Scatter(x=time_axis, y=srv_pid, name="Classical PID", line=dict(color="#38bdf8")))
-    if enable_ml:
-        fig_srv.add_trace(go.Scatter(x=time_axis, y=srv_ml, name="ML Feedforward + PID", line=dict(color="#22c55e", width=2.5)))
-    fig_srv.update_layout(
-        title="Active Servers Provisioned",
-        xaxis_title="Time (seconds)",
-        yaxis_title="Server Count",
-        height=340,
-        template="plotly_dark",
-    )
-    st.plotly_chart(fig_srv, use_container_width=True)
-
-with tab2:
-    fig_ml = go.Figure()
-    fig_ml.add_trace(go.Scatter(x=time_axis, y=traffic, name="Actual Traffic (req/s)", line=dict(color="#38bdf8")))
-    fig_ml.add_trace(
-        go.Scatter(x=time_axis, y=ml_preds, name="LightGBM 30s-Ahead Forecast", line=dict(color="#f59e0b", dash="dot"))
-    )
-    fig_ml.update_layout(
-        title="LightGBM Traffic Forecaster (Feeds the Feedforward Compensator)",
-        xaxis_title="Time (seconds)",
-        yaxis_title="Requests / sec",
-        height=420,
-        template="plotly_dark",
-    )
-    st.plotly_chart(fig_ml, use_container_width=True)
-
-with tab3:
-    st.markdown(
-        r"Linearized Plant Model (First-Order Plus Dead-Time): "
-        r"$G(s) = \frac{1}{Ts + 1} e^{-\tau s}$"
-    )
-    T_const = 20.0
-    tau_sec = float(boot_delay * 10)
-
-    num_d, den_d = ctrl.pade(tau_sec, 1)
-    G_plant = ctrl.tf([1], [T_const, 1]) * ctrl.tf(num_d, den_d)
-    # Scale continuous PID gains for frequency-domain representation
-    C_pid = ctrl.tf([Kd * 100, Kp * 20, Ki * 5], [1, 0])
-    L = C_pid * G_plant
-
-    gm, pm, wg, wp = ctrl.margin(L)
-    gm_db = 20 * np.log10(gm) if (gm is not None and gm > 0 and np.isfinite(gm)) else float("inf")
-    is_stable = (gm > 1 if np.isfinite(gm) else True) and (pm > 0)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Gain Margin", f"{gm_db:.2f} dB")
-    m2.metric("Phase Margin", f"{pm:.2f}°")
-    m3.metric("Closed-Loop Stability", "STABLE" if is_stable else "UNSTABLE")
-
-    omega = np.logspace(-3, 1, 300)
-    mag, phase, w = ctrl.frequency_response(L, omega)
-    mag_db = 20 * np.log10(np.maximum(mag, 1e-12))
-    phase_deg = np.degrees(phase)
-
-    fig_bode = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=("Magnitude (dB)", "Phase (deg)"))
-    fig_bode.add_trace(go.Scatter(x=w, y=mag_db, name="Magnitude", line=dict(color="#38bdf8")), row=1, col=1)
-    fig_bode.add_hline(y=0, line_dash="dot", line_color="#ef4444", row=1, col=1)
-    fig_bode.add_trace(go.Scatter(x=w, y=phase_deg, name="Phase", line=dict(color="#22c55e")), row=2, col=1)
-    fig_bode.add_hline(y=-180, line_dash="dot", line_color="#ef4444", row=2, col=1)
-    fig_bode.update_xaxes(type="log", title_text="Frequency (rad/s)", row=2, col=1)
-    fig_bode.update_layout(height=500, template="plotly_dark", showlegend=False)
-    st.plotly_chart(fig_bode, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
